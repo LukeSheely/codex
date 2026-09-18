@@ -7,6 +7,9 @@ use codex_core::config::Constrained;
 use codex_features::Feature;
 use codex_history::RolloutItem;
 use codex_login::CodexAuth;
+use codex_login::auth::BedrockApiKeyAuth;
+use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_prompts::render_model_instructions;
@@ -43,6 +46,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_image_generation_call;
+use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_sse_once;
@@ -169,6 +173,124 @@ fn configure_model_switching_fixture(model: &mut ModelInfo) {
     model.multi_agent_version = None;
     model.use_responses_lite = false;
     model.comp_hash = None;
+}
+
+#[test_case("amazon-bedrock-runtime"; "bedrock filters prior model reasoning")]
+#[test_case("openai"; "other providers retain reasoning")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_switch_encrypted_reasoning_request_projection(provider: &str) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    let prior_reasoning = ev_reasoning_item("rs_prior", &[], &["prior model"]);
+    let next_reasoning = ev_reasoning_item("rs_next", &[], &["next model"]);
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                prior_reasoning.clone(),
+                ev_assistant_message("msg-1", "visible history"),
+                ev_completed("resp-1"),
+            ]),
+            sse_completed("resp-2"),
+            sse(vec![
+                ev_response_created("resp-3"),
+                next_reasoning.clone(),
+                ev_assistant_message("msg-3", "new model answer"),
+                ev_completed("resp-3"),
+            ]),
+            sse_completed("resp-4"),
+        ],
+    )
+    .await;
+
+    let initial_model = "us.openai.gpt-5.6-sol";
+    let next_model = "us.openai.gpt-5.6-terra";
+    let mut builder = test_codex();
+    for model in [initial_model, next_model] {
+        builder = builder.with_model_info_override(model, |info| {
+            configure_model_switching_fixture(info);
+            info.comp_hash = Some("3000".to_string());
+            info.default_reasoning_summary = ReasoningSummary::None;
+        });
+    }
+    builder = builder.with_model(initial_model);
+    if provider == AMAZON_BEDROCK_RUNTIME_PROVIDER_ID {
+        builder = builder
+            .with_auth(CodexAuth::BedrockApiKey(BedrockApiKeyAuth {
+                api_key: "dummy".to_string(),
+                region: "us-east-1".to_string(),
+            }))
+            .with_config(|config| {
+                let base_url = config.model_provider.base_url.clone();
+                config.model_provider_id = AMAZON_BEDROCK_RUNTIME_PROVIDER_ID.to_string();
+                config.model_provider =
+                    ModelProviderInfo::create_amazon_bedrock_runtime_provider(/*aws*/ None);
+                config.model_provider.base_url = base_url;
+                config.model_reasoning_summary = Some(ReasoningSummary::None);
+            });
+    }
+    let test = builder.build_with_auto_env(&server).await?;
+    for model in [initial_model, initial_model, next_model, next_model] {
+        submit_model_turn(&test.codex, model, ThreadSettingsOverrides::default()).await?;
+    }
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 4);
+    let reasoning_inputs: Vec<Vec<serde_json::Value>> = requests
+        .iter()
+        .map(|request| {
+            request
+                .input()
+                .into_iter()
+                .filter(|item| item["type"] == "reasoning")
+                .map(|item| item["encrypted_content"].clone())
+                .collect()
+        })
+        .collect();
+    let prior = prior_reasoning["item"]["encrypted_content"].clone();
+    let next = next_reasoning["item"]["encrypted_content"].clone();
+    let expected = if provider == AMAZON_BEDROCK_RUNTIME_PROVIDER_ID {
+        vec![vec![], vec![prior.clone()], vec![], vec![next.clone()]]
+    } else {
+        vec![
+            vec![],
+            vec![prior.clone()],
+            vec![prior.clone()],
+            vec![prior.clone(), next.clone()],
+        ]
+    };
+    assert_eq!(reasoning_inputs, expected);
+    assert_eq!(requests[2].body_json()["model"], next_model);
+    assert!(requests[2].has_content_kinds(&["model_switch.instructions"]));
+    assert!(
+        requests[2]
+            .message_input_texts("assistant")
+            .iter()
+            .any(|text| text == "visible history")
+    );
+
+    test.codex.ensure_rollout_materialized().await;
+    test.codex.flush_rollout().await?;
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let saved_reasoning = std::fs::read_to_string(rollout_path)?
+        .lines()
+        .map(codex_rollout::parse_rollout_line)
+        .collect::<serde_json::Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|line| match line.item {
+            RolloutItem::ResponseItem(envelope) => match envelope.item {
+                codex_protocol::models::ResponseItem::Reasoning {
+                    encrypted_content, ..
+                } => encrypted_content.map(serde_json::Value::String),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(saved_reasoning, vec![prior, next]);
+    Ok(())
 }
 
 #[test_case(None; "model only")]

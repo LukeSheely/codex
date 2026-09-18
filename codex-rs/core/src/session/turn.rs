@@ -12,6 +12,7 @@ use crate::compact::run_inline_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
+use crate::context::ModelSwitchInstructions;
 use crate::context::UserVerificationNotice;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
@@ -510,13 +511,16 @@ pub(crate) async fn run_turn(
                 .await;
 
             // Construct the input that we will send to the model.
-            let sampling_request_input: Vec<ResponseItem> = async {
+            let mut sampling_request_input: Vec<ResponseItem> = async {
                 sess.clone_history()
                     .await
                     .for_prompt(&step_context.settings.model_info.input_modalities)
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
+            if step_context.turn.provider.info().is_amazon_bedrock() {
+                strip_pre_switch_encrypted_reasoning(&mut sampling_request_input);
+            }
 
             let responses_metadata = sess
                 .responses_metadata(step_context.as_ref(), CodexResponsesRequestKind::Turn)
@@ -3033,6 +3037,40 @@ async fn try_run_sampling_request(
     }
 
     outcome
+}
+
+/// Bedrock rejects encrypted reasoning produced by a different model. Keep the
+/// persisted history intact, but omit only the encrypted reasoning that predates
+/// the most recent model-switch instruction from the next request.
+fn strip_pre_switch_encrypted_reasoning(items: &mut Vec<ResponseItem>) {
+    let Some(model_switch_index) = items.iter().rposition(|item| {
+        matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if role == "developer"
+                    && content.iter().any(|content| {
+                        matches!(
+                            content,
+                            ContentItem::InputText { text }
+                                if ModelSwitchInstructions::matches_text(text)
+                        )
+                    })
+        )
+    }) else {
+        return;
+    };
+
+    let items_after_model_switch = items.split_off(model_switch_index);
+    items.retain(|item| {
+        !matches!(
+            item,
+            ResponseItem::Reasoning {
+                encrypted_content: Some(_),
+                ..
+            }
+        )
+    });
+    items.extend(items_after_model_switch);
 }
 
 pub(crate) fn get_last_assistant_message_from_turn<'a>(
