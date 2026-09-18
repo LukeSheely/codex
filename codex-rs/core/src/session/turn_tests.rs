@@ -3,6 +3,7 @@ use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnItemContributor;
 use codex_protocol::ResponseItemId;
 use codex_protocol::items::AgentMessageContent;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use tracing_subscriber::prelude::*;
@@ -37,6 +38,75 @@ fn assistant_output_text(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+fn encrypted_reasoning(id: &str) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: Some(ResponseItemId::with_suffix("rs", id)),
+        summary: vec![ReasoningItemReasoningSummary::SummaryText {
+            text: "summary".to_string(),
+        }],
+        content: None,
+        encrypted_content: Some("encrypted".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn model_switch_message() -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: ModelSwitchInstructions::new("new model instructions").render(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+#[test]
+fn model_switch_request_omits_only_prior_encrypted_reasoning() {
+    let before_switch = encrypted_reasoning("before");
+    let after_switch = encrypted_reasoning("after");
+    let mut visible_reasoning = encrypted_reasoning("visible");
+    if let ResponseItem::Reasoning {
+        encrypted_content, ..
+    } = &mut visible_reasoning
+    {
+        *encrypted_content = None;
+    }
+    let tool_result = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: Some("call-1".to_string()),
+        name: None,
+        namespace: None,
+        output: codex_protocol::models::FunctionCallOutputPayload::from_text("done".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let assistant_message = assistant_output_text("visible history");
+    let mut items = vec![
+        model_switch_message(),
+        before_switch,
+        visible_reasoning.clone(),
+        assistant_message.clone(),
+        tool_result.clone(),
+        model_switch_message(),
+        after_switch.clone(),
+    ];
+
+    strip_pre_switch_encrypted_reasoning(&mut items);
+
+    assert_eq!(
+        items,
+        vec![
+            model_switch_message(),
+            visible_reasoning,
+            assistant_message,
+            tool_result,
+            model_switch_message(),
+            after_switch,
+        ]
+    );
 }
 
 #[test]
